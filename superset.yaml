@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Superset server by GSNeotek
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access into the Superset web server
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+  InstanceType: 
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t3.medium
+    AllowedValues: 
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+      - c5.large
+      - c5.xlarge
+      - r5.large
+      - r5.xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+  AccessLocation:
+    Description: The IP address range that can be web access to the EC2 instances
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  VPCID:
+    Type: "AWS::EC2::VPC::Id"
+    Description: Vpcid of your existing Virtual Private Cloud (VPC)
+  SubnetID:
+    Type: "AWS::EC2::Subnet::Id"
+    Description: The list of SubnetIds in your Virtual Private Cloud (VPC)
+  AdminUserName:
+    Default : admin
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: Must contain only alphanumeric characters
+  AdminFirstName:
+    Default : admin
+    Type: String
+    ConstraintDescription: Must contain only alphanumeric characters
+  AdminLastname:
+    Default : user
+    Type: String
+    ConstraintDescription: Must contain only alphanumeric characters
+  AdminPassword:
+    NoEcho: 'true'
+    Type: String
+    ConstraintDescription: Minimum eight characters, at least one letter and one number
+  AdminEmail:
+    Default : test@test.com
+    Type: String
+    ConstraintDescription: Must enter a valid email
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Network Configuration"
+        Parameters: 
+          - VPCID
+          - SubnetID
+      - 
+        Label: 
+          default: "Amazon EC2 Configuration"
+        Parameters: 
+          - InstanceType
+          - KeyName
+          - AccessLocation
+      -
+        Label: 
+          default: "Superset Configuration"
+        Parameters: 
+          - AdminUserName
+          - AdminFirstName
+          - AdminLastname
+          - AdminPassword
+          - AdminEmail
+          - LoadSupersetExamples
+    ParameterLabels: 
+      VPCID: 
+        default: "Which VPC should this be deployed to?"
+      
+# Mapping to find the Amazon Linux AMI in each region.
+Mappings:
+  RegionMap:
+    ap-northeast-2:
+      AMI: ami-018a9a930060d38aa
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      SubnetId: !Ref 'SubnetID'
+      KeyName: !Ref 'KeyName'
+      SecurityGroupIds: [!GetAtt SupersetEC2SecurityGroup.GroupId]
+      InstanceType: !Ref 'InstanceType'
+      Tags:
+        -
+          Key: Name
+          Value: Superset
+      ImageId: !FindInMap
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - AMI
+      UserData:
+        Fn::Base64: !Sub |
+         #!/bin/bash
+         set -x
+         exec > >(tee /var/log/user-data.log|logger -t user-data ) 2>&1
+         # Get the latest CloudFormation package
+         echo "Installing aws-cfn"
+         yum install -y aws-cfn-bootstrap
+         # Start cfn-init
+         /opt/aws/bin/cfn-init -v -c install --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+
+         # Yum update
+         yum update -y
+
+         # Install Superset using pip3
+         echo "Install Apache Superset"
+         yum install -y python3
+         yum install -y gcc gcc-c++ libffi-devel python3-devel python3-pip python3-wheel openssl-devel libsasl2-devel openldap-devel
+         
+         python3 -m venv venv
+         . venv/bin/activate
+
+         pip3 install --upgrade setuptools
+         pip3 install pandas==0.23.4
+         pip3 install sqlalchemy==1.2.18
+         pip3 install superset==0.28.1
+
+         pip3 install "PyAthena>1.2.0"
+
+         fabmanager create-admin --app superset --username ${AdminUserName} --firstname ${AdminFirstName} --lastname ${AdminLastname} --email ${AdminEmail} --password ${AdminPassword}
+
+         # Initalise the database
+         superset db upgrade
+
+         # Load examples, if yes
+         superset load_examples
+
+         # Create default roles and permissions
+         superset init
+
+         # To start a development web server on port 8088, use -p to bind to another port
+         superset runserver -d &
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          install:
+            - gcc
+        gcc:
+          packages:
+            yum:
+              gcc: []
+    DependsOn:
+      - SupersetEC2SecurityGroup
+  SupersetEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: SupersetSG
+      GroupDescription: Enable HTTP access via port 8088 + SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8088
+          ToPort: 8088
+          CidrIp: !Ref 'AccessLocation'
+      VpcId: !Ref 'VPCID'
+Outputs:
+  SupersetEC2PublicDNSName:
+    Description: Public DNS Name of the Superset EC2 instance
+    Value: !Join ["", ["http://", !GetAtt EC2Instance.PublicDnsName, ":8088"]]
